@@ -1,6 +1,7 @@
 # HealthFirst Claudia — AgenTao + Gemini Live + OpenClaw
 
-Inbound appointment agent: **book**, **reschedule**, or **cancel**. No Google ADK.
+Inbound appointment agent: **book**, **reschedule**, or **cancel**. 
+
 
 ## Architecture
 
