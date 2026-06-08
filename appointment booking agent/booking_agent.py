@@ -1,9 +1,9 @@
 """HealthFirst Clinic inbound appointment agent (Claudia).
 
 Responsibility split (do not mix these layers):
-- AgenTao SDK: phone audio in/out only.
+- Telcoflow SDK: phone audio in/out only.
 - Gemini Live: real-time voice conversation only (no Google ADK).
-- OpenClaw: post-call extraction, WhatsApp delivery, orchestration.
+- OpenClaw: optional post-call extraction; WhatsApp delivery; Gemini key via onboarding config.
 - gog CLI: Google Calendar only (OAuth via `gog auth` — no service-account JSON in this repo).
 - Internal CLI tools: gog calendar + bookings.json + OpenClaw WhatsApp (for exec fallback).
 
@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -32,8 +33,14 @@ from zoneinfo import ZoneInfo
 
 from google import genai
 from google.genai import types
-from AgenTao_sdk import ActiveCall, AgenTaoClient, AgenTaoClientConfig
-import AgenTao_sdk.events as events
+try:
+    from telcoflow_sdk import ActiveCall, TelcoflowClient, TelcoflowClientConfig
+except ImportError as exc:
+    raise ImportError(
+        "telcoflow-sdk is missing or too old (need >= 0.5, recommended 0.27.1). "
+        "In your venv run: pip install -r requirements.txt"
+    ) from exc
+import telcoflow_sdk.events as events
 
 try:
     from dotenv import load_dotenv
@@ -47,18 +54,23 @@ if load_dotenv is not None:
 # Runtime configuration
 # ---------------------------------------------------------------------------
 
-SCRIPT_PATH = Path(__file__).resolve()
 AUDIO_MIME_TYPE = "audio/pcm;rate=24000"
 BOOKINGS_PATH = Path(os.getenv("BOOKINGS_PATH", "bookings.json")).resolve()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
+MAX_SLOT_SEARCH_ITERATIONS = int(os.getenv("MAX_SLOT_SEARCH_ITERATIONS", "200"))
 OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT", "main")
 OPENCLAW_TIMEOUT_SECONDS = int(os.getenv("OPENCLAW_TIMEOUT_SECONDS", "900"))
 LOG_TRANSCRIPTS = os.getenv("LOG_TRANSCRIPTS", "true").lower() in {"1", "true", "yes", "on"}
-CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "Asia/Singapore")
+CLINIC_TIMEZONE = os.getenv("CLINIC_TIMEZONE", "Asia/Kolkata")
 APPOINTMENT_DURATION_MINUTES = int(os.getenv("APPOINTMENT_DURATION_MINUTES", "30"))
 CLINIC_OPEN_HOUR = int(os.getenv("CLINIC_OPEN_HOUR", "9"))
 CLINIC_CLOSE_HOUR = int(os.getenv("CLINIC_CLOSE_HOUR", "17"))
 GOG_BIN = os.getenv("GOG_BIN", "gog").strip()
+GOG_ACCOUNT = os.getenv("GOG_ACCOUNT", "").strip()
+GOG_CLIENT = os.getenv("GOG_CLIENT", "").strip()
+GOG_KEYRING_BACKEND = os.getenv("GOG_KEYRING_BACKEND", "").strip()
+GOG_KEYRING_PASSWORD = os.getenv("GOG_KEYRING_PASSWORD", "").strip()
 DEFAULT_PHONE_COUNTRY_CODE = os.getenv("DEFAULT_PHONE_COUNTRY_CODE", "91").strip()
 WHATSAPP_CLINIC_NUMBER = os.getenv("WHATSAPP_CLINIC_NUMBER", "").strip()
 WHATSAPP_OPENCLAW_ACCOUNT = os.getenv("WHATSAPP_OPENCLAW_ACCOUNT", "").strip()
@@ -70,23 +82,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Claudia's live voice instructions — conversation only; no calendar or messaging here.
-CLAUDIA_SYSTEM_PROMPT = """Your name is Claudia. You are an appointment assistant for HealthFirst Clinic.
-You are warm, calm, and professional at all times.
-You greet every caller with: Hi, thank you for calling HealthFirst Clinic. I am Claudia, your appointment assistant. I can help you book, reschedule, or cancel an appointment. What would you like to do today?
-You handle three intents: booking a new appointment, rescheduling an existing appointment, and cancelling an existing appointment.
+CLAUDIA_SYSTEM_PROMPT = """Your name is Claudia. You are an administrative appointment assistant for HealthFirst Clinic.
+You are warm, calm, professional, and concise. Keep replies to one or two short sentences when possible.
 
-For booking collect one step at a time: patient full name, contact phone number, preferred date, preferred time, appointment type (general checkup, specialist, or follow-up).
-For rescheduling collect: patient name, existing appointment date, new preferred date, new preferred time.
-For cancellation collect: patient name, existing appointment date, then confirm before ending.
+Greet every caller with: Hi, thanks for calling HealthFirst Clinic. I'm Claudia. I can help you book, reschedule, or cancel. What would you like to do?
 
-WhatsApp (optional — never pressure the patient):
-After you have the main appointment details, ask once in a friendly way: "Would you like a summary on WhatsApp? The number you're calling from — is that your WhatsApp number?"
-- If yes, the calling number is their WhatsApp — note that and move on.
-- If no to the calling number but they still want WhatsApp, say they can tell you the WhatsApp number to use.
-- If they do not want WhatsApp, say "No worries at all" and do not ask again.
+INTAKE — all intents:
+Listen carefully to everything the caller says from their very first response. Many callers introduce themselves and state their full request in one message, for example: "Hi, I'm Harshal, I want to book a general appointment today at 5 PM." When a caller already provides any of these details, treat them as collected and do not ask again:
+- Patient full name
+- Phone number
+- Preferred appointment date and time (or existing appointment date for reschedule or cancel)
+- Type of appointment: general checkup, specialist, or follow-up
 
-Always confirm all details clearly with the patient before ending the call.
-Never tell the patient their booking is fully confirmed during the call. Say our team will review the details and confirm shortly.
+Only ask for details that are still missing. If the caller gave name, appointment type, date, and time upfront, acknowledge what you heard (for example: "Got it, Harshal — a general checkup today at 5 PM") and ask only for what is missing, usually the phone number.
+Never repeat a question for information the caller already clearly stated in this call.
+The same upfront-intake rules apply to reschedule and cancel — do not re-ask name or dates already stated.
+
+Required fields by intent:
+- Book: patient full name, contact phone number, preferred date, preferred time, appointment type.
+- Reschedule: patient name, existing appointment date, new preferred date, new preferred time.
+- Cancel: patient name, existing appointment date.
+
+Always map caller wording to one of these appointment types: general checkup, specialist, or follow-up.
+If the patient says to use the number they are calling from as their contact phone, accept that.
+When collecting a phone number, read it back clearly to confirm.
+
+Do not promise a specific time is available during the call. Say the slot will be confirmed when we process the booking after this call.
+
+READ-BACK (required before ending):
+Summarize once in clear order — for booking: name, phone, date, time, and type; for reschedule: name, existing date, new date and time; for cancel: name and existing date.
+Then ask: "Is that correct?" Wait for an affirmative response before continuing.
+
+WHATSAPP (optional — never pressure the patient):
+After read-back is confirmed, ask about WhatsApp in two short questions, not one combined question:
+1. "Would you like your appointment confirmation sent on WhatsApp?"
+2. Only if they say yes: "Is the number you're calling from your WhatsApp number?"
+- If yes to both, the calling number is their WhatsApp — note that and move on.
+- If they want WhatsApp but the calling number is not their WhatsApp, ask: "No problem — which WhatsApp number should I use?"
+- If they decline WhatsApp, say "No problem at all" and do not ask again.
+- Do not ask about WhatsApp before the read-back is confirmed.
+
+CLOSING:
+After they confirm the read-back, tell them their appointment is booked and will be processed after this call.
+- If they opted in for WhatsApp, say a confirmation message will be sent shortly.
+- If they declined WhatsApp, say our team will call them shortly to confirm.
+Do not promise WhatsApp if they declined it.
+
+BOUNDARIES:
+You are administrative only. Do not provide medical advice, diagnoses, treatment recommendations, or clinical opinions. If asked medical questions, politely say you cannot help with clinical matters and suggest speaking with a doctor or nurse at the clinic.
+If the caller describes an urgent medical emergency (for example chest pain, difficulty breathing, severe bleeding, or someone unconscious), stop the booking flow immediately. Tell them to hang up and call their local emergency number now. Do not continue scheduling until they confirm it is not an emergency.
+
 If the patient asks about insurance verification, let them know the team will follow up with them directly."""
 
 
@@ -109,15 +154,150 @@ def require_env(name: str) -> str:
     return value
 
 
+def _parse_dotenv_value(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _google_api_key_from_openclaw_dotenv() -> str | None:
+    """Read GEMINI/GOOGLE key from ~/.openclaw/.env (OpenClaw global fallback)."""
+    dotenv_path = Path(os.getenv("OPENCLAW_STATE_DIR", Path.home() / ".openclaw")) / ".env"
+    if not dotenv_path.exists():
+        return None
+    for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key.strip() in {"GOOGLE_API_KEY", "GEMINI_API_KEY"}:
+            parsed = _parse_dotenv_value(value)
+            if parsed:
+                return parsed
+    return None
+
+
+def _google_api_key_from_openclaw_config() -> str | None:
+    """Read Gemini key stored by `openclaw onboard --auth-choice gemini-api-key`."""
+    if not shutil.which("openclaw"):
+        return None
+    for config_path in (
+        "models.providers.google.apiKey",
+        "env.vars.GOOGLE_API_KEY",
+        "env.vars.GEMINI_API_KEY",
+        "env.GOOGLE_API_KEY",
+        "env.GEMINI_API_KEY",
+    ):
+        try:
+            result = subprocess.run(
+                ["openclaw", "config", "get", config_path],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        value = result.stdout.strip().strip('"').strip("'")
+        if not value or value in {"null", "undefined"}:
+            continue
+        if value.startswith("${") or value.startswith("secretref-"):
+            continue
+        if isinstance(value, str) and value.startswith("{"):
+            continue
+        return value
+    return None
+
+
+def resolve_google_api_key() -> str:
+    """Gemini key for Python Live + text extraction.
+
+    Precedence:
+    1. GOOGLE_API_KEY / GEMINI_API_KEY in this process env (agent .env)
+    2. OpenClaw onboarding config (~/.openclaw/openclaw.json via `openclaw config get`)
+    3. ~/.openclaw/.env
+    """
+    for name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+
+    from_config = _google_api_key_from_openclaw_config()
+    if from_config:
+        logger.info("Using Gemini API key from OpenClaw onboarding config")
+        return from_config
+
+    from_dotenv = _google_api_key_from_openclaw_dotenv()
+    if from_dotenv:
+        logger.info("Using Gemini API key from ~/.openclaw/.env")
+        return from_dotenv
+
+    raise RuntimeError(
+        "No Google/Gemini API key found for Claudia's voice bridge. Either:\n"
+        "  - Complete OpenClaw onboarding: openclaw onboard --auth-choice gemini-api-key\n"
+        "  - Or set GOOGLE_API_KEY in this agent's .env (same key is fine)"
+    )
+
+
+def gog_global_flags() -> list[str]:
+    """Global gog flags: --account / --client (see GOG_ACCOUNT, GOG_CLIENT)."""
+    flags: list[str] = []
+    if GOG_ACCOUNT:
+        flags.extend(["--account", GOG_ACCOUNT])
+    if GOG_CLIENT:
+        flags.extend(["--client", GOG_CLIENT])
+    return flags
+
+
+def build_gog_command(*args: str) -> list[str]:
+    """Build a gog argv list with shared global flags before the subcommand."""
+    return [GOG_BIN, *gog_global_flags(), *args]
+
+
+def gog_subprocess_env() -> dict[str, str]:
+    """Env for gog subprocesses — headless Linux needs file keyring, not D-Bus."""
+    env = os.environ.copy()
+    backend = GOG_KEYRING_BACKEND or (
+        "file" if sys.platform.startswith("linux") else ""
+    )
+    if backend:
+        env["GOG_KEYRING_BACKEND"] = backend
+    if GOG_KEYRING_PASSWORD:
+        env["GOG_KEYRING_PASSWORD"] = GOG_KEYRING_PASSWORD
+    return env
+
+
+def _gog_keyring_hint(stderr: str) -> str:
+    if not any(
+        token in stderr
+        for token in ("keyring", "SecretService", "D-Bus", "GOG_KEYRING")
+    ):
+        return ""
+    return (
+        " Headless servers cannot use D-Bus SecretService. Add to .env:\n"
+        "  GOG_KEYRING_BACKEND=file\n"
+        "  GOG_KEYRING_PASSWORD=<choose-a-strong-password>\n"
+        "Then on the server (with those exports set):\n"
+        "  gog auth keyring file\n"
+        "  gog auth credentials set ~/client_secret.json --client healthfirst\n"
+        "  gog auth add clinic@gmail.com --client healthfirst --services calendar --remote --step 1\n"
+        "  # complete OAuth step 2 with the redirect URL"
+    )
+
+
 def ensure_gog_cli() -> None:
     """Verify the gog Google Calendar CLI is installed and authenticated."""
     try:
         result = subprocess.run(
-            [GOG_BIN, "calendar", "calendars", "--json", "--no-input"],
+            build_gog_command("--json", "--no-input", "calendar", "calendars"),
             check=False,
             capture_output=True,
             text=True,
             timeout=60,
+            env=gog_subprocess_env(),
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
@@ -125,18 +305,28 @@ def ensure_gog_cli() -> None:
         ) from exc
 
     if result.returncode != 0:
+        stderr = result.stderr.strip()
+        hint = _gog_keyring_hint(stderr)
+        if not hint and ("missing --account" in stderr or "GOG_ACCOUNT" in stderr):
+            hint = (
+                " Set GOG_ACCOUNT in .env to the clinic Google account you authenticated "
+                "(e.g. clinic@gmail.com). If you used a named OAuth client during "
+                "`gog auth add`, also set GOG_CLIENT. Or run: "
+                "`gog auth alias set default <email>` on the server."
+            )
+        elif not hint and ("auth" in stderr.lower() or "token" in stderr.lower()):
+            hint = " Run: gog auth add <clinic@gmail.com> --services calendar"
         raise RuntimeError(
-            "gog is not ready for Calendar. Run: gog auth\n"
-            f"stderr: {result.stderr.strip()}"
+            "gog is not ready for Calendar." + hint + f"\nstderr: {stderr}"
         )
 
 
 def make_gemini_client() -> genai.Client:
-    return genai.Client(api_key=require_env("GOOGLE_API_KEY"))
+    return genai.Client(api_key=resolve_google_api_key())
 
 
-def make_AgenTao_config() -> AgenTaoClientConfig:
-    return AgenTaoClientConfig.sandbox(
+def make_telcoflow_config() -> TelcoflowClientConfig:
+    return TelcoflowClientConfig.sandbox(
         api_key=require_env("WSS_API_KEY"),
         connector_uuid=require_env("WSS_CONNECTOR_UUID"),
         sample_rate=24000,
@@ -215,17 +405,20 @@ class GogCalendarClient:
         self.timezone = ZoneInfo(timezone_name)
 
     def _run(self, *args: str) -> dict[str, Any]:
-        command = [GOG_BIN, "--json", "--no-input", "calendar", *args]
+        command = build_gog_command("--json", "--no-input", "calendar", *args)
         result = subprocess.run(
             command,
             check=False,
             capture_output=True,
             text=True,
             timeout=120,
+            env=gog_subprocess_env(),
         )
         if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout
+            hint = _gog_keyring_hint(stderr)
             raise RuntimeError(
-                f"gog calendar failed ({' '.join(command)}): {result.stderr.strip() or result.stdout}"
+                f"gog calendar failed ({' '.join(command)}): {stderr}{hint}"
             )
         stdout = result.stdout.strip()
         if not stdout:
@@ -272,7 +465,7 @@ class GogCalendarClient:
     def is_available(self, appointment: AppointmentRange) -> bool:
         payload = self._run(
             "freebusy",
-            "--calendars",
+            "--cal",
             self.calendar_id,
             "--from",
             appointment.start.isoformat(),
@@ -295,7 +488,7 @@ class GogCalendarClient:
             f"{intent_label} via Claudia phone agent.\n"
             f"Patient: {patient_name}\n"
             f"Phone: {phone_number}\n"
-            f"AgenTao call id: {call_id}"
+            f"Telcoflow call id: {call_id}"
         )
         payload = self._run(
             "create",
@@ -343,24 +536,40 @@ class GogCalendarClient:
     def delete_event(self, event_id: str) -> None:
         self._run("delete", self.calendar_id, event_id, "--force")
 
+    def _next_clinic_open(self, after: datetime) -> datetime:
+        """Next Mon–Fri slot at or after `after`, within clinic hours."""
+        candidate = after
+        for _ in range(MAX_SLOT_SEARCH_ITERATIONS):
+            if candidate.hour < CLINIC_OPEN_HOUR:
+                candidate = candidate.replace(
+                    hour=CLINIC_OPEN_HOUR, minute=0, second=0, microsecond=0
+                )
+            elif candidate.hour >= CLINIC_CLOSE_HOUR:
+                candidate = (candidate + timedelta(days=1)).replace(
+                    hour=CLINIC_OPEN_HOUR, minute=0, second=0, microsecond=0
+                )
+            if candidate.weekday() < 5:
+                return candidate
+            days_ahead = 7 - candidate.weekday()
+            candidate = (candidate + timedelta(days=days_ahead)).replace(
+                hour=CLINIC_OPEN_HOUR, minute=0, second=0, microsecond=0
+            )
+        return candidate
+
     def next_available_slots(
         self,
         requested: AppointmentRange,
         count: int = 3,
     ) -> list[dict[str, str]]:
         slots: list[dict[str, str]] = []
-        candidate_start = requested.start + timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
+        candidate_start = self._next_clinic_open(
+            requested.start + timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
+        )
 
-        while len(slots) < count:
-            if candidate_start.hour < CLINIC_OPEN_HOUR:
-                candidate_start = candidate_start.replace(
-                    hour=CLINIC_OPEN_HOUR, minute=0, second=0, microsecond=0
-                )
-            if candidate_start.hour >= CLINIC_CLOSE_HOUR:
-                next_day = candidate_start + timedelta(days=1)
-                candidate_start = next_day.replace(
-                    hour=CLINIC_OPEN_HOUR, minute=0, second=0, microsecond=0
-                )
+        iterations = 0
+        while len(slots) < count and iterations < MAX_SLOT_SEARCH_ITERATIONS:
+            iterations += 1
+            candidate_start = self._next_clinic_open(candidate_start)
 
             candidate = AppointmentRange(
                 start=candidate_start,
@@ -495,7 +704,7 @@ def record_transcript_line(transcript: list[TranscriptLine], speaker: str, text:
 
 
 # ---------------------------------------------------------------------------
-# Gemini Live voice bridge (AgenTao ↔ Gemini)
+# Gemini Live voice bridge (Telcoflow ↔ Gemini)
 # ---------------------------------------------------------------------------
 
 
@@ -504,7 +713,7 @@ async def run_gemini_voice_call(
     gemini_client: genai.Client,
     system_prompt: str = CLAUDIA_SYSTEM_PROMPT,
 ) -> list[TranscriptLine]:
-    """Stream AgenTao PCM to Gemini Live and play Claudia's audio responses back."""
+    """Stream Telcoflow PCM to Gemini Live and play Claudia's audio responses back."""
     transcript: list[TranscriptLine] = []
     call_ended = asyncio.Event()
 
@@ -537,50 +746,60 @@ async def run_gemini_voice_call(
         )
 
         async def stream_to_gemini() -> None:
-            async for chunk in call.audio_stream():
-                await session.send_realtime_input(
-                    audio=types.Blob(data=chunk, mime_type=AUDIO_MIME_TYPE)
-                )
+            try:
+                async for chunk in call.audio_stream():
+                    await session.send_realtime_input(
+                        audio=types.Blob(data=chunk, mime_type=AUDIO_MIME_TYPE)
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Failed streaming caller audio to Gemini")
+                raise
 
         async def receive_from_gemini() -> None:
-            while not call_ended.is_set():
-                async for response in session.receive():
-                    content = response.server_content
-                    if not content:
-                        continue
+            try:
+                while not call_ended.is_set():
+                    async for response in session.receive():
+                        content = response.server_content
+                        if not content:
+                            continue
 
-                    if content.input_transcription and content.input_transcription.text:
-                        record_transcript_line(transcript, "PATIENT", content.input_transcription.text)
+                        if content.input_transcription and content.input_transcription.text:
+                            record_transcript_line(
+                                transcript, "PATIENT", content.input_transcription.text
+                            )
 
-                    if content.output_transcription and content.output_transcription.text:
-                        record_transcript_line(transcript, "CLAUDIA", content.output_transcription.text)
+                        if content.output_transcription and content.output_transcription.text:
+                            record_transcript_line(
+                                transcript, "CLAUDIA", content.output_transcription.text
+                            )
 
-                    if content.interrupted:
-                        if hasattr(call, "interrupt"):
-                            await call.interrupt()
-                        else:
-                            await call.clear_send_audio_buffer()
-                        break
+                        if content.interrupted:
+                            if hasattr(call, "interrupt"):
+                                await call.interrupt()
+                            else:
+                                await call.clear_send_audio_buffer()
+                            break
 
-                    if content.model_turn:
-                        for part in content.model_turn.parts:
-                            if part.inline_data and part.inline_data.data:
-                                await call.send_audio(part.inline_data.data)
+                        if content.model_turn:
+                            for part in content.model_turn.parts:
+                                if part.inline_data and part.inline_data.data:
+                                    await call.send_audio(part.inline_data.data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Failed receiving Gemini audio responses")
+                raise
 
-        async def wait_for_call_end() -> None:
+        stream_task = asyncio.create_task(stream_to_gemini())
+        receive_task = asyncio.create_task(receive_from_gemini())
+        try:
             await call_ended.wait()
-
-        tasks = [
-            asyncio.create_task(stream_to_gemini()),
-            asyncio.create_task(receive_from_gemini()),
-            asyncio.create_task(wait_for_call_end()),
-        ]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            task.result()
+        finally:
+            stream_task.cancel()
+            receive_task.cancel()
+            await asyncio.gather(stream_task, receive_task, return_exceptions=True)
 
     return transcript
 
@@ -591,7 +810,7 @@ async def run_gemini_voice_call(
 
 
 class OpenClawClient:
-    """Runs documented `openclaw agent` turns (OpenClaw has no API key of its own)."""
+    """Runs `openclaw agent` turns using keys from OpenClaw onboarding config."""
 
     def __init__(self, agent: str = OPENCLAW_AGENT, timeout: int = OPENCLAW_TIMEOUT_SECONDS):
         self.agent = agent
@@ -602,8 +821,12 @@ class OpenClawClient:
 
     def _run_json_sync(self, session_key: str, message: str) -> dict[str, Any]:
         env = os.environ.copy()
-        env["GEMINI_API_KEY"] = env.get("GEMINI_API_KEY") or require_env("GOOGLE_API_KEY")
-        env["GOOGLE_API_KEY"] = require_env("GOOGLE_API_KEY")
+        # OpenClaw reads provider keys from ~/.openclaw/openclaw.json after onboarding.
+        # Only inject env when this agent's .env sets them explicitly.
+        api_key = os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
+        if api_key:
+            env.setdefault("GEMINI_API_KEY", api_key)
+            env.setdefault("GOOGLE_API_KEY", api_key)
 
         command = [
             "openclaw",
@@ -628,8 +851,16 @@ class OpenClawClient:
             env=env,
         )
         if result.returncode != 0:
+            stderr = result.stderr.strip()
+            hint = ""
+            if "Unknown model:" in stderr or "plugins.allow is empty" in stderr:
+                hint = (
+                    " Fix ~/.openclaw/openclaw.json: set plugins.allow to "
+                    '["google","whatsapp"], set agents.defaults.model.primary to a model from '
+                    "`openclaw models list --provider google`, then restart openclaw-gateway."
+                )
             raise RuntimeError(
-                f"OpenClaw command failed (exit {result.returncode}): {result.stderr.strip()}"
+                f"OpenClaw command failed (exit {result.returncode}): {stderr}{hint}"
             )
         return parse_openclaw_json(result.stdout)
 
@@ -679,25 +910,27 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Post-call: OpenClaw extraction + execution
+# Post-call: extraction + deterministic execution
 # ---------------------------------------------------------------------------
 
-
-async def extract_call_with_openclaw(
-    openclaw: OpenClawClient,
-    call: ActiveCall,
-    rendered_transcript: str,
-) -> dict[str, Any]:
-    """Ask OpenClaw to extract intent and structured fields from the transcript."""
+def build_extraction_prompt(call: ActiveCall, rendered_transcript: str) -> str:
+    """Shared extraction instructions for OpenClaw and Gemini text fallback."""
     today = datetime.now(ZoneInfo(CLINIC_TIMEZONE)).date().isoformat()
-    message = f"""
+    return f"""
 You are Claudia's post-call extraction worker for HealthFirst Clinic.
 
 Rules:
-- Use OpenClaw with GOOGLE_API_KEY / GEMINI_API_KEY routing only. OpenClaw has no API key of its own.
 - Read the transcript and extract structured data only.
 - Do not access Google Calendar, bookings.json, or WhatsApp in this step.
 - Today is {today}; resolve relative dates to YYYY-MM-DD.
+- Claudia's final read-back before ending is the authoritative source when the patient agrees.
+- If Claudia summarizes the appointment and asks "Is that correct?" (or similar), and the patient replies with any affirmative phrase such as yes, yeah, correct, all right, alright, okay, that's right, perfect, sounds good, or equivalent, use Claudia's summarized details and return status "extracted".
+- Prefer Claudia's final confirmed values over earlier noisy patient speech-to-text, especially for phone numbers and appointment times.
+- Only return needs_human_review when a required field is missing or the patient explicitly contradicts or corrects Claudia's final read-back.
+- Normalize phone_number to digits only, optionally with a leading +. If Claudia confirmed a specific phone number and the patient agreed, use Claudia's number.
+- Use caller_number metadata only when Claudia said the patient is calling from that number or did not state any specific phone number: {call.caller_number or "unknown"}
+- Map appointment_type to exactly one of: general checkup, specialist, follow-up.
+- If the caller intent is unclear or required fields are missing, set status to needs_human_review.
 
 Intents (each block must include WhatsApp fields below):
 - book: patient_name, phone_number, appointment_date, appointment_time, appointment_type
@@ -705,7 +938,7 @@ Intents (each block must include WhatsApp fields below):
 - cancel: patient_name, existing_appointment_date
 
 WhatsApp fields on book / reschedule / cancel (required on the active intent block):
-- wants_patient_whatsapp: true if patient wants a WhatsApp summary; false if they declined or it was not discussed
+- wants_patient_whatsapp: true if patient agreed to receive confirmation on WhatsApp; false if they declined; if Claudia never asked about WhatsApp, set false and note it in notes
 - caller_is_whatsapp: true if patient said the calling number is their WhatsApp; false if they said it is not; null if unclear
 - whatsapp_number: E.164 or local digits only when patient gave a different WhatsApp number; null otherwise
 
@@ -742,7 +975,7 @@ Return only one JSON object:
   "notes": "short operational note"
 }}
 
-AgenTao metadata:
+Telcoflow metadata:
 - call_id: {call.call_id}
 - caller_number: {call.caller_number}
 - callee_number: {call.callee_number}
@@ -750,68 +983,184 @@ AgenTao metadata:
 Transcript:
 {rendered_transcript}
 """.strip()
-    return await openclaw.run_json(f"healthfirst-claudia-extract-{call.call_id}", message)
 
 
-async def execute_with_openclaw(
-    openclaw: OpenClawClient,
-    call: ActiveCall,
-    extraction: dict[str, Any],
-) -> dict[str, Any]:
-    """Ask OpenClaw to orchestrate gog Calendar, bookings.json, and WhatsApp."""
-    calendar_id = require_env("GOOGLE_CALENDAR_ID")
-    clinic_line = (
-        f"Optional clinic ops number: {WHATSAPP_CLINIC_NUMBER}"
-        if WHATSAPP_CLINIC_NUMBER
-        else "No clinic ops number configured (patient WhatsApp only)."
-    )
+def build_extraction_retry_prompt(call: ActiveCall, rendered_transcript: str) -> str:
+    """Second pass when the patient agreed to Claudia's read-back but the first pass was incomplete."""
+    today = datetime.now(ZoneInfo(CLINIC_TIMEZONE)).date().isoformat()
+    return f"""
+The caller already confirmed Claudia's final read-back with yes, all right, okay, or similar.
 
-    message = f"""
-You are Claudia's post-call execution worker for HealthFirst Clinic.
+Extract ONLY from Claudia's final confirmation summary in the transcript.
+Use Claudia's values for name, phone, dates, times, appointment type, and intent.
+Do not return needs_human_review because of earlier garbled patient speech if the patient agreed to Claudia's summary.
+Today is {today}; resolve relative dates to YYYY-MM-DD.
+Use caller_number only when Claudia said the patient is calling from that number: {call.caller_number or "unknown"}
 
-Rules:
-- Use OpenClaw with GOOGLE_API_KEY / GEMINI_API_KEY routing only. OpenClaw has no API key of its own.
-- Do NOT use Meta WhatsApp Business API tokens. WhatsApp is linked via OpenClaw (WhatsApp Web).
-- Do NOT use Google service-account JSON or the Python google-api-python-client. Calendar is **gog only**.
-- Return one final JSON object when finished.
-
-Google Calendar — use **gog** CLI only (calendar id: "{calendar_id}"):
-  gog --json calendar freebusy --calendars "{calendar_id}" --from <RFC3339> --to <RFC3339>
-  gog --json calendar create {calendar_id} --summary "..." --from <RFC3339> --to <RFC3339> --description "..."
-  gog --json calendar update {calendar_id} <eventId> --from <RFC3339> --to <RFC3339>
-  gog --json calendar delete {calendar_id} <eventId> --force
-
-Or run the bundled internal helpers (they call gog + update bookings.json + WhatsApp):
-  python {SCRIPT_PATH} internal create-booking --payload '<json>' --call-id {call.call_id} --fallback-phone {call.caller_number}
-  python {SCRIPT_PATH} internal reschedule-booking --payload '<json>' --fallback-phone {call.caller_number}
-  python {SCRIPT_PATH} internal cancel-booking --payload '<json>' --fallback-phone {call.caller_number}
-
-bookings.json path: {BOOKINGS_PATH} (read/write via file tools or internal commands above)
-
-WhatsApp (gateway must be running):
-  openclaw message send --channel whatsapp --target +<E164> --message "<text>"
-- **Clinic ({clinic_line}):** ALWAYS send full booking details for team review and confirmation.
-- **Patient:** ONLY if wants_patient_whatsapp is true in extraction. Use whatsapp_number, or caller if caller_is_whatsapp, or phone_number. Caller fallback: {call.caller_number}. Patient message is a receipt/summary — team confirms later.
-
-Extraction JSON:
-{json.dumps(extraction, indent=2)}
-
-Execution rules by intent:
-- book: gog freebusy → if available gog create + bookings.json (status pending_review) + clinic WhatsApp + patient WhatsApp only if wants_patient_whatsapp
-- if busy: alternatives + clinic WhatsApp + optional patient WhatsApp
-- reschedule / cancel: same patient WhatsApp rules; clinic always gets full details
-
-Return only JSON:
+Return only one JSON object:
 {{
-  "status": "confirmed" | "rescheduled" | "cancelled" | "unavailable" | "needs_human_review" | "failed",
-  "booking": null | {{ "id", "patient_name", "phone_number", "appointment_date", "appointment_time", "appointment_type", "status", "calendar_event_id" }},
-  "next_available_slots": [],
-  "patient_whatsapp_sent": true | false,
-  "clinic_whatsapp_sent": true | false,
+  "status": "extracted" | "needs_human_review",
+  "intent": "book" | "reschedule" | "cancel" | null,
+  "book": null | {{
+    "patient_name": "string",
+    "phone_number": "string",
+    "appointment_date": "YYYY-MM-DD",
+    "appointment_time": "HH:MM",
+    "appointment_type": "general checkup|specialist|follow-up",
+    "wants_patient_whatsapp": true | false,
+    "caller_is_whatsapp": true | false | null,
+    "whatsapp_number": "string | null"
+  }},
+  "reschedule": null | {{
+    "patient_name": "string",
+    "existing_appointment_date": "YYYY-MM-DD",
+    "new_appointment_date": "YYYY-MM-DD",
+    "new_appointment_time": "HH:MM",
+    "wants_patient_whatsapp": true | false,
+    "caller_is_whatsapp": true | false | null,
+    "whatsapp_number": "string | null"
+  }},
+  "cancel": null | {{
+    "patient_name": "string",
+    "existing_appointment_date": "YYYY-MM-DD",
+    "wants_patient_whatsapp": true | false,
+    "caller_is_whatsapp": true | false | null,
+    "whatsapp_number": "string | null"
+  }},
   "notes": "short operational note"
 }}
+
+Transcript:
+{rendered_transcript}
 """.strip()
-    return await openclaw.run_json(f"healthfirst-claudia-execute-{call.call_id}", message)
+
+
+def openclaw_available() -> bool:
+    return shutil.which("openclaw") is not None
+
+
+def normalize_extraction(extraction: dict[str, Any]) -> dict[str, Any]:
+    """Ensure extraction payloads are usable by the deterministic executor."""
+    if extraction.get("status") != "extracted":
+        return extraction
+
+    intent = extraction.get("intent")
+    if intent not in {"book", "reschedule", "cancel"}:
+        extraction["status"] = "needs_human_review"
+        extraction["notes"] = extraction.get("notes", "Intent missing or unsupported.")
+        return extraction
+
+    block = extraction.get(intent)
+    if not isinstance(block, dict):
+        extraction["status"] = "needs_human_review"
+        extraction["notes"] = extraction.get("notes", f"Missing {intent} payload.")
+        return extraction
+
+    required_by_intent = {
+        "book": {
+            "patient_name",
+            "phone_number",
+            "appointment_date",
+            "appointment_time",
+            "appointment_type",
+        },
+        "reschedule": {
+            "patient_name",
+            "existing_appointment_date",
+            "new_appointment_date",
+            "new_appointment_time",
+        },
+        "cancel": {"patient_name", "existing_appointment_date"},
+    }
+    missing = [key for key in required_by_intent[intent] if not str(block.get(key, "")).strip()]
+    if missing:
+        extraction["status"] = "needs_human_review"
+        extraction["notes"] = (
+            extraction.get("notes", "")
+            + f" Missing fields: {', '.join(missing)}"
+        ).strip()
+
+    return extraction
+
+
+async def extract_call_with_openclaw(
+    openclaw: OpenClawClient,
+    call: ActiveCall,
+    rendered_transcript: str,
+) -> dict[str, Any]:
+    """Ask OpenClaw to extract intent and structured fields from the transcript."""
+    message = build_extraction_prompt(call, rendered_transcript)
+    return normalize_extraction(
+        await openclaw.run_json(f"healthfirst-claudia-extract-{call.call_id}", message)
+    )
+
+
+def extract_call_with_gemini_sync(
+    gemini_client: genai.Client,
+    call: ActiveCall,
+    rendered_transcript: str,
+) -> dict[str, Any]:
+    """Deterministic JSON extraction fallback when OpenClaw is unavailable or fails."""
+    prompt = build_extraction_prompt(call, rendered_transcript)
+    response = gemini_client.models.generate_content(
+        model=GEMINI_TEXT_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+    text = (response.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini extraction returned empty text.")
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Gemini extraction did not return a JSON object.")
+    return normalize_extraction(parsed)
+
+
+async def extract_call_with_gemini(
+    gemini_client: genai.Client,
+    call: ActiveCall,
+    rendered_transcript: str,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        extract_call_with_gemini_sync, gemini_client, call, rendered_transcript
+    )
+
+
+def retry_extract_call_with_gemini_sync(
+    gemini_client: genai.Client,
+    call: ActiveCall,
+    rendered_transcript: str,
+) -> dict[str, Any]:
+    """Re-extract from Claudia's confirmed read-back when the first pass was incomplete."""
+    prompt = build_extraction_retry_prompt(call, rendered_transcript)
+    response = gemini_client.models.generate_content(
+        model=GEMINI_TEXT_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0,
+        ),
+    )
+    text = (response.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini extraction retry returned empty text.")
+    parsed = extract_json_object(text)
+    if parsed is None:
+        raise RuntimeError("Gemini extraction retry did not return valid JSON.")
+    return normalize_extraction(parsed)
+
+
+async def retry_extract_call_with_gemini(
+    gemini_client: genai.Client,
+    call: ActiveCall,
+    rendered_transcript: str,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        retry_extract_call_with_gemini_sync, gemini_client, call, rendered_transcript
+    )
 
 
 def normalize_phone(value: str, fallback: str) -> str:
@@ -888,19 +1237,26 @@ def format_clinic_review_message(
     alternatives: list[dict[str, str]] | None = None,
     notes: str = "",
 ) -> str:
-    """Full details for clinic staff to review and confirm."""
+    """Full booking details for clinic staff."""
+    if outcome == "needs_human_review":
+        header = "HealthFirst Clinic — needs manual follow-up"
+    elif outcome == "unavailable":
+        header = "HealthFirst Clinic — action needed"
+    else:
+        header = "HealthFirst Clinic — booking update"
+
     lines = [
-        "HealthFirst Clinic — please review & confirm",
+        header,
         f"Action: {action}",
         f"Outcome: {outcome}",
         f"Patient: {patient_name}",
         f"Contact phone: {phone_number}",
-        f"AgenTao call: {call_id}",
+        f"Telcoflow call: {call_id}",
     ]
     if appointment_type:
         lines.append(f"Appointment type: {appointment_type}")
     if appointment_date and appointment_time:
-        lines.append(f"Requested slot: {appointment_date} at {appointment_time}")
+        lines.append(f"Slot: {appointment_date} at {appointment_time}")
     if existing_date:
         lines.append(f"Existing appointment date: {existing_date}")
     if new_date and new_time:
@@ -909,17 +1265,25 @@ def format_clinic_review_message(
         lines.append(f"Booking id: {booking_id}")
     if calendar_event_id:
         lines.append(f"Calendar event id: {calendar_event_id}")
-    lines.append(
-        f"Patient WhatsApp receipt: {'yes' if wants_patient_whatsapp else 'no'}"
-        + (f" → {patient_whatsapp_target}" if wants_patient_whatsapp and patient_whatsapp_target else "")
-    )
+    if wants_patient_whatsapp:
+        lines.append(
+            "Patient WhatsApp confirmation: sent"
+            + (f" → {patient_whatsapp_target}" if patient_whatsapp_target else "")
+        )
+    else:
+        lines.append(f"Patient WhatsApp: declined — please call {phone_number} to confirm.")
     if alternatives:
         lines.append("Suggested alternatives:")
         for slot in alternatives:
             lines.append(f"  - {slot['appointment_date']} at {slot['appointment_time']}")
     if notes:
         lines.append(f"Notes: {notes}")
-    lines.append("Please confirm with the patient when ready.")
+    if outcome == "needs_human_review":
+        lines.append("Please follow up with the patient manually.")
+    elif outcome == "unavailable":
+        lines.append("Please contact the patient with alternative times.")
+    elif outcome in {"confirmed", "cancelled"}:
+        lines.append("Booking is on the calendar. Call the patient only if they declined WhatsApp.")
     return "\n".join(lines)
 
 
@@ -935,26 +1299,53 @@ def format_patient_receipt(
     new_time: str | None = None,
     alternatives: list[dict[str, str]] | None = None,
 ) -> str:
-    """Patient-facing WhatsApp summary — receipt only; team confirms later."""
+    """Patient-facing WhatsApp confirmation or update."""
+    if alternatives:
+        lines = [
+            f"Hi {patient_name}, thank you for calling HealthFirst Clinic.",
+            f"We could not complete your {action} request for the time you wanted.",
+        ]
+        if appointment_type:
+            lines.append(f"Type: {appointment_type}")
+        if appointment_date and appointment_time:
+            lines.append(f"Requested: {appointment_date} at {appointment_time}")
+        if existing_date:
+            lines.append(f"Previous date: {existing_date}")
+        if new_date and new_time:
+            lines.append(f"Requested new time: {new_date} at {new_time}")
+        lines.append("Suggested times:")
+        for slot in alternatives:
+            lines.append(f"- {slot['appointment_date']} at {slot['appointment_time']}")
+        lines.append("Please call us back or reply to choose another time.")
+        return "\n".join(lines)
+
+    if action == "cancellation":
+        lines = [
+            f"Hi {patient_name}, your HealthFirst Clinic appointment",
+            f"on {existing_date} has been cancelled as requested.",
+            "If you would like to rebook, please call us anytime.",
+        ]
+        return "\n".join(lines)
+
+    if action == "reschedule":
+        lines = [
+            f"Hi {patient_name}, your HealthFirst Clinic appointment is rescheduled.",
+            f"Previous date: {existing_date}",
+            f"New date: {new_date}",
+            f"New time: {new_time}",
+            "We look forward to seeing you.",
+        ]
+        return "\n".join(lines)
+
     lines = [
-        f"Hi {patient_name}, thank you for calling HealthFirst Clinic.",
-        f"Here is a summary of your {action} request:",
+        f"Hi {patient_name}, your HealthFirst Clinic appointment is confirmed.",
     ]
     if appointment_type:
         lines.append(f"Type: {appointment_type}")
     if appointment_date and appointment_time:
         lines.append(f"Date: {appointment_date}")
         lines.append(f"Time: {appointment_time}")
-    if existing_date:
-        lines.append(f"Previous date: {existing_date}")
-    if new_date and new_time:
-        lines.append(f"New date: {new_date}")
-        lines.append(f"New time: {new_time}")
-    if alternatives:
-        lines.append("Suggested times:")
-        for slot in alternatives:
-            lines.append(f"- {slot['appointment_date']} at {slot['appointment_time']}")
-    lines.append("Our team will review and send a final confirmation shortly.")
+    lines.append("We look forward to seeing you. Reply if you need to change or cancel.")
     return "\n".join(lines)
 
 
@@ -962,7 +1353,7 @@ def build_booking_record(
     fields: dict[str, str],
     event_id: str,
     prefs: WhatsAppPrefs,
-    status: str = "pending_review",
+    status: str = "confirmed",
 ) -> dict[str, str]:
     return {
         "id": str(uuid.uuid4()),
@@ -984,6 +1375,73 @@ def _whatsapp_result(patient_sent: bool, clinic_sent: bool) -> dict[str, Any]:
         "clinic_whatsapp_sent": clinic_sent,
         "whatsapp_sent": patient_sent or clinic_sent,
     }
+
+
+def _needs_review_result(notes: str) -> dict[str, Any]:
+    return {
+        "status": "needs_human_review",
+        "booking": None,
+        "next_available_slots": [],
+        "patient_whatsapp_sent": False,
+        "clinic_whatsapp_sent": False,
+        "whatsapp_sent": False,
+        "notes": notes,
+    }
+
+
+def _patient_name_from_extraction(extraction: dict[str, Any] | None) -> str:
+    if not extraction:
+        return "Unknown"
+    for key in ("book", "reschedule", "cancel"):
+        block = extraction.get(key)
+        if isinstance(block, dict):
+            name = str(block.get("patient_name") or "").strip()
+            if name:
+                return name
+    return "Unknown"
+
+
+def notify_clinic_human_review(
+    call: ActiveCall,
+    rendered_transcript: str,
+    notes: str,
+    extraction: dict[str, Any] | None = None,
+) -> bool:
+    """Alert clinic staff when a call needs manual follow-up."""
+    excerpt = rendered_transcript.strip()
+    if len(excerpt) > 2000:
+        excerpt = excerpt[:2000] + "…"
+    message = format_clinic_review_message(
+        "needs human review",
+        patient_name=_patient_name_from_extraction(extraction),
+        phone_number=call.caller_number,
+        call_id=call.call_id,
+        outcome="needs_human_review",
+        notes=(notes or "Manual follow-up required.") + (f"\n\nTranscript:\n{excerpt}" if excerpt else ""),
+    )
+    return notify_clinic_whatsapp(message)
+
+
+def attach_clinic_review_alert(
+    result: dict[str, Any],
+    call: ActiveCall,
+    rendered_transcript: str,
+    extraction: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Send a clinic WhatsApp alert once when post-call processing needs a human."""
+    if result.get("status") != "needs_human_review":
+        return result
+    if result.get("clinic_whatsapp_sent"):
+        return result
+    clinic_sent = notify_clinic_human_review(
+        call,
+        rendered_transcript,
+        str(result.get("notes") or ""),
+        extraction,
+    )
+    result["clinic_whatsapp_sent"] = clinic_sent
+    result["whatsapp_sent"] = bool(result.get("patient_whatsapp_sent")) or clinic_sent
+    return result
 
 
 def execute_booking_intent(
@@ -1048,7 +1506,7 @@ def execute_booking_intent(
         patient_name=record["patient_name"],
         phone_number=record["phone_number"],
         call_id=call_id,
-        outcome="pending_review",
+        outcome="confirmed",
         booking_id=record["id"],
         appointment_date=record["appointment_date"],
         appointment_time=record["appointment_time"],
@@ -1062,10 +1520,10 @@ def execute_booking_intent(
         notify_clinic_whatsapp(clinic_msg),
     )
     return {
-        "status": "pending_review",
+        "status": "confirmed",
         "booking": record,
         "next_available_slots": [],
-        "notes": "Calendar hold created; clinic notified to confirm. Patient receipt only if they opted in.",
+        "notes": "Appointment confirmed on calendar. Patient WhatsApp sent if opted in; otherwise clinic should call.",
         **wa,
     }
 
@@ -1081,15 +1539,7 @@ def execute_reschedule_intent(
     prefs = resolve_whatsapp_prefs(whatsapp_block, fallback_phone)
     existing = store.find_active(fields["patient_name"], fields["existing_appointment_date"])
     if not existing:
-        return {
-            "status": "needs_human_review",
-            "booking": None,
-            "next_available_slots": [],
-            "patient_whatsapp_sent": False,
-            "clinic_whatsapp_sent": False,
-            "whatsapp_sent": False,
-            "notes": "No matching booking found for reschedule.",
-        }
+        return _needs_review_result("No matching booking found for reschedule.")
 
     new_range = calendar.appointment_range(
         fields["new_appointment_date"],
@@ -1145,7 +1595,7 @@ def execute_reschedule_intent(
         {
             "appointment_date": fields["new_appointment_date"],
             "appointment_time": fields["new_appointment_time"][:5],
-            "status": "pending_review",
+            "status": "confirmed",
             "wants_patient_whatsapp": prefs.wants_patient,
             "whatsapp_number": prefs.patient_target or "",
         },
@@ -1163,7 +1613,7 @@ def execute_reschedule_intent(
         patient_name=updated_fields["patient_name"],
         phone_number=updated_fields["phone_number"],
         call_id=call_id,
-        outcome="pending_review",
+        outcome="confirmed",
         booking_id=existing["id"],
         existing_date=fields["existing_appointment_date"],
         new_date=fields["new_appointment_date"],
@@ -1177,10 +1627,10 @@ def execute_reschedule_intent(
         notify_clinic_whatsapp(clinic_msg),
     )
     return {
-        "status": "pending_review",
+        "status": "confirmed",
         "booking": updated,
         "next_available_slots": [],
-        "notes": "Reschedule recorded; clinic to confirm. Patient receipt only if opted in.",
+        "notes": "Reschedule confirmed on calendar. Patient WhatsApp sent if opted in; otherwise clinic should call.",
         **wa,
     }
 
@@ -1196,15 +1646,7 @@ def execute_cancel_intent(
     prefs = resolve_whatsapp_prefs(whatsapp_block, fallback_phone)
     existing = store.find_active(fields["patient_name"], fields["existing_appointment_date"])
     if not existing:
-        return {
-            "status": "needs_human_review",
-            "booking": None,
-            "next_available_slots": [],
-            "patient_whatsapp_sent": False,
-            "clinic_whatsapp_sent": False,
-            "whatsapp_sent": False,
-            "notes": "No matching booking found for cancellation.",
-        }
+        return _needs_review_result("No matching booking found for cancellation.")
 
     calendar.delete_event(str(existing["calendar_event_id"]))
     updated = store.update_record(
@@ -1241,7 +1683,7 @@ def execute_cancel_intent(
         "status": "cancelled",
         "booking": updated,
         "next_available_slots": [],
-        "notes": "Cancellation processed; clinic notified. Patient receipt only if opted in.",
+        "notes": "Cancellation processed; clinic notified. Patient WhatsApp sent if opted in; otherwise clinic should call.",
         **wa,
     }
 
@@ -1250,17 +1692,9 @@ def execute_extraction_locally(
     extraction: dict[str, Any],
     call: ActiveCall,
 ) -> dict[str, Any]:
-    """Run gog Calendar / bookings.json / WhatsApp when OpenClaw execute turn fails."""
+    """Run gog Calendar / bookings.json / WhatsApp after transcript extraction."""
     if extraction.get("status") != "extracted":
-        return {
-            "status": "needs_human_review",
-            "booking": None,
-            "next_available_slots": [],
-            "patient_whatsapp_sent": False,
-            "clinic_whatsapp_sent": False,
-            "whatsapp_sent": False,
-            "notes": extraction.get("notes", "Extraction incomplete."),
-        }
+        return _needs_review_result(extraction.get("notes", "Extraction incomplete."))
 
     calendar = make_gog_calendar()
     store = BookingStore()
@@ -1269,13 +1703,7 @@ def execute_extraction_locally(
     if intent == "book":
         book = extraction.get("book")
         if not isinstance(book, dict):
-            return {
-                "status": "needs_human_review",
-                "booking": None,
-                "next_available_slots": [],
-                "whatsapp_sent": False,
-                "notes": "Missing book payload.",
-            }
+            return _needs_review_result("Missing book payload.")
         fields = {
             "patient_name": str(book["patient_name"]).strip(),
             "phone_number": normalize_phone(str(book.get("phone_number", "")), call.caller_number),
@@ -1290,18 +1718,12 @@ def execute_extraction_locally(
     if intent == "reschedule":
         payload = extraction.get("reschedule")
         if not isinstance(payload, dict):
-            return {
-                "status": "needs_human_review",
-                "booking": None,
-                "next_available_slots": [],
-                "whatsapp_sent": False,
-                "notes": "Missing reschedule payload.",
-            }
+            return _needs_review_result("Missing reschedule payload.")
         fields = {
-            key: str(payload[key]).strip()
-            for key in payload
-            if key
-            not in {"wants_patient_whatsapp", "caller_is_whatsapp", "whatsapp_number"}
+            "patient_name": str(payload["patient_name"]).strip(),
+            "existing_appointment_date": str(payload["existing_appointment_date"]).strip(),
+            "new_appointment_date": str(payload["new_appointment_date"]).strip(),
+            "new_appointment_time": str(payload["new_appointment_time"]).strip(),
         }
         return execute_reschedule_intent(
             fields, payload, calendar, store, call.call_id, call.caller_number
@@ -1310,62 +1732,71 @@ def execute_extraction_locally(
     if intent == "cancel":
         payload = extraction.get("cancel")
         if not isinstance(payload, dict):
-            return {
-                "status": "needs_human_review",
-                "booking": None,
-                "next_available_slots": [],
-                "whatsapp_sent": False,
-                "notes": "Missing cancel payload.",
-            }
+            return _needs_review_result("Missing cancel payload.")
         fields = {
-            key: str(payload[key]).strip()
-            for key in payload
-            if key
-            not in {"wants_patient_whatsapp", "caller_is_whatsapp", "whatsapp_number"}
+            "patient_name": str(payload["patient_name"]).strip(),
+            "existing_appointment_date": str(payload["existing_appointment_date"]).strip(),
         }
         return execute_cancel_intent(
             fields, payload, calendar, store, call.call_id, call.caller_number
         )
 
-    return {
-        "status": "needs_human_review",
-        "booking": None,
-        "next_available_slots": [],
-        "whatsapp_sent": False,
-        "notes": "Unknown intent.",
-    }
+    return _needs_review_result("Unknown intent.")
 
 
-async def process_call_with_openclaw(
+async def process_call_post_call(
+    gemini_client: genai.Client,
     openclaw: OpenClawClient,
     call: ActiveCall,
     transcript: list[TranscriptLine],
 ) -> dict[str, Any]:
-    """Full post-call pipeline: OpenClaw extract → OpenClaw execute (with local fallback)."""
+    """Extract intent from transcript, then execute deterministically via gog + bookings.json."""
     rendered = transcript_text(transcript)
     if not rendered.strip():
-        raise RuntimeError("Gemini did not return a transcript for OpenClaw to process.")
+        raise RuntimeError("Gemini did not return a transcript for post-call processing.")
 
-    logger.info("Call %s: OpenClaw extraction", call.call_id)
-    extraction = await extract_call_with_openclaw(openclaw, call, rendered)
+    extraction: dict[str, Any] | None = None
 
-    try:
-        logger.info("Call %s: OpenClaw execution", call.call_id)
-        result = await execute_with_openclaw(openclaw, call, extraction)
-        if result.get("status") in {
-            "confirmed",
-            "pending_review",
-            "rescheduled",
-            "cancelled",
-            "unavailable",
-            "needs_human_review",
-        }:
-            return result
-        logger.warning("Call %s: OpenClaw execution returned unexpected payload; using local fallback", call.call_id)
-    except Exception as exc:
-        logger.warning("Call %s: OpenClaw execution failed (%s); using local fallback", call.call_id, exc)
+    if openclaw_available():
+        try:
+            logger.info("Call %s: OpenClaw extraction", call.call_id)
+            candidate = await extract_call_with_openclaw(openclaw, call, rendered)
+            if candidate.get("status") == "extracted":
+                extraction = candidate
+            else:
+                logger.warning(
+                    "Call %s: OpenClaw extraction incomplete (%s); trying Gemini",
+                    call.call_id,
+                    candidate.get("notes", "needs_human_review"),
+                )
+        except Exception as exc:
+            logger.warning("Call %s: OpenClaw extraction failed (%s); trying Gemini", call.call_id, exc)
+    else:
+        logger.info("Call %s: OpenClaw CLI not found; using Gemini extraction", call.call_id)
 
-    return execute_extraction_locally(extraction, call)
+    if extraction is None:
+        logger.info("Call %s: Gemini extraction", call.call_id)
+        try:
+            extraction = await extract_call_with_gemini(gemini_client, call, rendered)
+        except Exception as exc:
+            logger.exception("Call %s: Gemini extraction failed", call.call_id)
+            extraction = _needs_review_result(f"Extraction failed: {exc}")
+
+    if extraction.get("status") == "needs_human_review":
+        logger.info(
+            "Call %s: retrying extraction using Claudia's confirmed read-back",
+            call.call_id,
+        )
+        try:
+            retry = await retry_extract_call_with_gemini(gemini_client, call, rendered)
+            if retry.get("status") == "extracted":
+                extraction = retry
+        except Exception as exc:
+            logger.warning("Call %s: extraction retry failed (%s)", call.call_id, exc)
+
+    logger.info("Call %s: local execution (%s)", call.call_id, extraction.get("intent"))
+    result = execute_extraction_locally(extraction, call)
+    return attach_clinic_review_alert(result, call, rendered, extraction)
 
 
 # ---------------------------------------------------------------------------
@@ -1386,10 +1817,12 @@ def run_internal_tool(argv: list[str]) -> int:
 
     resched = sub.add_parser("reschedule-booking")
     resched.add_argument("--payload", required=True)
+    resched.add_argument("--call-id", default="manual")
     resched.add_argument("--fallback-phone", default="")
 
     cancel = sub.add_parser("cancel-booking")
     cancel.add_argument("--payload", required=True)
+    cancel.add_argument("--call-id", default="manual")
     cancel.add_argument("--fallback-phone", default="")
 
     wa = sub.add_parser("whatsapp")
@@ -1400,13 +1833,21 @@ def run_internal_tool(argv: list[str]) -> int:
     calendar = make_gog_calendar()
     store = BookingStore()
 
+    def intent_fields(payload: dict[str, Any], keys: list[str]) -> dict[str, str]:
+        return {key: str(payload[key]).strip() for key in keys}
+
     if args.tool == "create-booking":
         payload = json.loads(args.payload)
-        fields = {
-            k: str(v).strip()
-            for k, v in payload.items()
-            if k not in {"wants_patient_whatsapp", "caller_is_whatsapp", "whatsapp_number"}
-        }
+        fields = intent_fields(
+            payload,
+            [
+                "patient_name",
+                "phone_number",
+                "appointment_date",
+                "appointment_time",
+                "appointment_type",
+            ],
+        )
         result = execute_booking_intent(
             fields, payload, calendar, store, args.call_id, args.fallback_phone
         )
@@ -1415,11 +1856,15 @@ def run_internal_tool(argv: list[str]) -> int:
 
     if args.tool == "reschedule-booking":
         payload = json.loads(args.payload)
-        fields = {
-            k: str(v).strip()
-            for k, v in payload.items()
-            if k not in {"wants_patient_whatsapp", "caller_is_whatsapp", "whatsapp_number"}
-        }
+        fields = intent_fields(
+            payload,
+            [
+                "patient_name",
+                "existing_appointment_date",
+                "new_appointment_date",
+                "new_appointment_time",
+            ],
+        )
         result = execute_reschedule_intent(
             fields, payload, calendar, store, args.call_id, args.fallback_phone
         )
@@ -1428,11 +1873,10 @@ def run_internal_tool(argv: list[str]) -> int:
 
     if args.tool == "cancel-booking":
         payload = json.loads(args.payload)
-        fields = {
-            k: str(v).strip()
-            for k, v in payload.items()
-            if k not in {"wants_patient_whatsapp", "caller_is_whatsapp", "whatsapp_number"}
-        }
+        fields = intent_fields(
+            payload,
+            ["patient_name", "existing_appointment_date"],
+        )
         result = execute_cancel_intent(
             fields, payload, calendar, store, args.call_id, args.fallback_phone
         )
@@ -1449,8 +1893,16 @@ def run_internal_tool(argv: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# AgenTao inbound handler
+# Telcoflow inbound handler
 # ---------------------------------------------------------------------------
+
+
+async def safe_disconnect(call: ActiveCall) -> None:
+    """Disconnect if still connected; ignore errors when the call already ended."""
+    try:
+        await call.disconnect()
+    except Exception as exc:
+        logger.debug("Call %s disconnect skipped (already ended): %s", call.call_id, exc)
 
 
 async def handle_incoming_call(
@@ -1460,17 +1912,17 @@ async def handle_incoming_call(
 ) -> None:
     """Answer the call with Claudia (Gemini Live), then hand off to OpenClaw."""
     transcript = await run_gemini_voice_call(call, gemini_client)
-    result = await process_call_with_openclaw(openclaw, call, transcript)
-    print(json.dumps({"call_id": call.call_id, "openclaw_result": result}, indent=2))
+    result = await process_call_post_call(gemini_client, openclaw, call, transcript)
+    print(json.dumps({"call_id": call.call_id, "post_call_result": result}, indent=2))
 
 
 async def main() -> None:
     ensure_gog_cli()
     gemini_client = make_gemini_client()
     openclaw = OpenClawClient()
-    config = make_AgenTao_config()
+    config = make_telcoflow_config()
 
-    async with AgenTaoClient(config) as client:
+    async with TelcoflowClient(config) as client:
         @client.on(events.INCOMING_CALL)
         async def on_call(call: ActiveCall) -> None:
             try:
@@ -1478,9 +1930,20 @@ async def main() -> None:
             except Exception as exc:
                 logger.exception("Call %s failed", call.call_id)
                 print(f"Call {call.call_id} failed: {exc}", file=sys.stderr)
-                await call.disconnect()
+                notify_clinic_whatsapp(
+                    "\n".join(
+                        [
+                            "HealthFirst Clinic — call processing failed",
+                            f"Telcoflow call: {call.call_id}",
+                            f"Caller: {call.caller_number}",
+                            f"Error: {exc}",
+                            "Please follow up with the patient manually.",
+                        ]
+                    )
+                )
+                await safe_disconnect(call)
 
-        logger.info("HealthFirst Claudia agent listening for inbound AgenTao calls")
+        logger.info("HealthFirst Claudia agent listening for inbound Telcoflow calls")
         await client.run_forever()
 
 
