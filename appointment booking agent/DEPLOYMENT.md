@@ -2,7 +2,7 @@
 
 This guide runs **two long-lived processes** on one Lightsail instance:
 
-1. **OpenClaw gateway** — WhatsApp Web session (Baileys)
+1. **OpenClaw gateway** — WhatsApp Web session
 2. **`booking_agent.py`** — AgenTao inbound calls + Gemini Live (Claudia) + post-call OpenClaw/gog
 
 AgenTao connects **outbound** from your instance to AgenTao’s servers (WebSocket). You do not need to open an inbound port for phone calls, but you need stable **outbound HTTPS (443)** and enough RAM for Node + Python + live audio.
@@ -13,7 +13,7 @@ AgenTao connects **outbound** from your instance to AgenTao’s servers (WebSock
 
 | Item | Where to get it |
 | --- | --- |
-| AgenTao `WSS_API_KEY` + `WSS_CONNECTOR_UUID` | [AgenTao dashboard](https://docs.AgenTao.com) |
+| AgenTao `WSS_API_KEY` + `WSS_CONNECTOR_UUID` | [AgenTao dashboard](http://www.agentao.com/) |
 | `GOOGLE_API_KEY` | Google AI Studio / Cloud (Gemini Live + OpenClaw LLM) |
 | Google account for clinic calendar | For `gog auth` (OAuth) |
 | Dedicated WhatsApp number (recommended) | SIM or spare phone for OpenClaw |
@@ -79,16 +79,9 @@ Install `gog` so `which gog` succeeds. Set `GOG_BIN=/usr/local/bin/gog` in `.env
 ## 4. Deploy the agent code
 
 ```bash
-sudo mkdir -p /opt/healthfirst
-sudo chown ubuntu:ubuntu /opt/healthfirst
-cd /opt/healthfirst
-
-# Option A: git clone your repo
-git clone https://github.com/YOUR_ORG/YOUR_REPO.git .
-cd healthfirst_claudia
-
-# Option B: scp from laptop
-# scp -i key.pem -r ./healthfirst_claudia ubuntu@YOUR_IP:/opt/healthfirst/
+git clone your repo
+git clone https://github.com/harshal-ships/Appoint-booking-agent-with-OpenClaw.git .
+cd Appoint-booking-agent-with-OpenClaw
 
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -117,13 +110,6 @@ BOOKINGS_PATH=/opt/healthfirst/healthfirst_claudia/data/bookings.json
 CLINIC_TIMEZONE=Asia/Singapore
 LOG_LEVEL=INFO
 LOG_TRANSCRIPTS=true
-```
-
-```bash
-mkdir -p /opt/healthfirst/healthfirst_claudia/data
-touch /opt/healthfirst/healthfirst_claudia/data/bookings.json
-echo '{"bookings":[]}' > /opt/healthfirst/healthfirst_claudia/data/bookings.json
-chmod 600 .env
 ```
 
 ---
@@ -306,19 +292,6 @@ If the QR is too small over SSH:
 
 Session data lives under `~/.openclaw/` — back it up before rebuilding the instance.
 
-### Test gateway
-
-```bash
-openclaw gateway
-# Leave running in one terminal; you should see WhatsApp connected
-```
-
-In another SSH session:
-
-```bash
-openclaw message send --channel whatsapp --target +919322958608 --message "HealthFirst test from Lightsail"
-```
-
 ---
 
 ## 7. systemd — run on boot
@@ -351,148 +324,19 @@ sudo nano /etc/systemd/system/openclaw-gateway.service
 # Set GOOGLE_API_KEY and GEMINI_API_KEY to the same value as .env
 ```
 
-### Claudia booking agent
-
-```bash
-sudo tee /etc/systemd/system/healthfirst-claudia.service <<'EOF'
-[Unit]
-Description=HealthFirst Claudia AgenTao booking agent
-After=network-online.target openclaw-gateway.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/opt/healthfirst/healthfirst_claudia
-EnvironmentFile=/opt/healthfirst/healthfirst_claudia/.env
-Environment=HOME=/home/ubuntu
-Environment=GEMINI_API_KEY=%GOOGLE_API_KEY%
-ExecStart=/opt/healthfirst/healthfirst_claudia/.venv/bin/python booking_agent.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
-
 Enable and start:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable openclaw-gateway healthfirst-claudia
+sudo systemctl enable openclaw-gateway
 sudo systemctl start openclaw-gateway
 sleep 5
-sudo systemctl start healthfirst-claudia
 
-sudo systemctl status openclaw-gateway healthfirst-claudia
+sudo systemctl status openclaw-gateway
 sudo journalctl -u healthfirst-claudia -f
-sudo journalctl -u openclaw-gateway -f
 ```
 
 **Order:** start **gateway first**, then **booking agent**. The agent calls `openclaw message send` and `openclaw agent` while processing calls.
-
----
-
-## 8. AgenTao connector
-
-In the AgenTao console, point your connector at this deployment:
-
-- The agent uses **outbound** WSS with `WSS_API_KEY` / `WSS_CONNECTOR_UUID`.  
-- Confirm the connector is in **sandbox** or **prod** to match `AgenTaoClientConfig.sandbox()` in code (change to `.production()` when you go live).  
-- Place a test call; watch logs:
-
-```bash
-sudo journalctl -u healthfirst-claudia -f
-```
-
-You should see transcript lines, then OpenClaw extract/execute, then gog/WhatsApp activity.
-
----
-
-## 9. Smoke tests
-
-```bash
-cd /opt/healthfirst/healthfirst_claudia
-source .venv/bin/activate
-export $(grep -v '^#' .env | xargs)
-
-# gog
-gog calendar calendars --json
-
-# OpenClaw CLI (uses GOOGLE_API_KEY)
-openclaw agent --agent main --local --message "Reply with OK" --json
-
-# Internal booking path (optional)
-python booking_agent.py internal whatsapp --target +919322958608 --text "Internal tool test"
-```
-
----
-
-## 10. Operations
-
-| Task | Command |
-| --- | --- |
-| Restart agent | `sudo systemctl restart healthfirst-claudia` |
-| Restart WhatsApp | `sudo systemctl restart openclaw-gateway` |
-| View agent logs | `sudo journalctl -u healthfirst-claudia -f` |
-| View gateway logs | `sudo journalctl -u openclaw-gateway -f` |
-| Backup bookings | `cp data/bookings.json ~/bookings-backup-$(date +%F).json` |
-| Update code | `git pull && source .venv/bin/activate && pip install -r requirements.txt && sudo systemctl restart healthfirst-claudia` |
-
-**Persist on disk**
-
-- `data/bookings.json`  
-- `~/.openclaw/` (WhatsApp session + config)  
-- `~/.config/gog/` (Calendar OAuth tokens)
-
-Back up these before rebuilding the instance.
-
-**WhatsApp session expiry**
-
-If WhatsApp disconnects, re-run `openclaw channels login --channel whatsapp` and restart the gateway.
-
-**gog token expiry**
-
-Re-run `gog auth` locally and re-copy config, or refresh on the server.
-
----
-
-## 11. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-| --- | --- | --- |
-| `gog is not ready` | OAuth missing | `gog auth` + copy config to server |
-| `openclaw message send failed` | Gateway down | `sudo systemctl start openclaw-gateway` |
-| No patient WhatsApp | Patient declined on call | Expected; check extraction `wants_patient_whatsapp` |
-| No clinic WhatsApp | `WHATSAPP_CLINIC_NUMBER` empty | Set in `.env`, restart agent |
-| OpenClaw agent timeout | Slow model / network | Raise `OPENCLAW_TIMEOUT_SECONDS` |
-| Call connects, no voice | AgenTao / Gemini key | Check `WSS_*`, `GOOGLE_API_KEY`, logs |
-| OOM / killed | 1 GB instance | Resize to 2 GB RAM |
-
----
-
-## Architecture on Lightsail
-
-```text
-                    Internet (outbound 443)
-                              │
-         ┌────────────────────┼────────────────────┐
-         │         Lightsail Ubuntu VM             │
-         │                                       │
-         │  openclaw-gateway.service             │
-         │    └── WhatsApp Web (linked phone)    │
-         │                                       │
-         │  healthfirst-claudia.service          │
-         │    ├── AgenTao WSS (inbound calls)  │
-         │    ├── Gemini Live (Claudia voice)    │
-         │    ├── openclaw agent (post-call)     │
-         │    ├── gog calendar (OAuth)           │
-         │    └── openclaw message send          │
-         │                                       │
-         │  /opt/.../data/bookings.json          │
-         └───────────────────────────────────────┘
-```
 
 ---
 
