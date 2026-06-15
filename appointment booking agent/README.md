@@ -1,4 +1,4 @@
-# HealthFirst Claudia — Telcoflow + Nova Sonic 2 + OpenClaw
+# HealthFirst Claudia — AgentDuet + Nova Sonic 2 + OpenClaw
 
 Inbound appointment agent: **book**, **reschedule**, or **cancel**. 
 
@@ -6,7 +6,7 @@ Inbound appointment agent: **book**, **reschedule**, or **cancel**.
 ## Architecture
 
 ```
-Patient call → Telcoflow → Nova Sonic 2 (Claudia voice)
+Patient call → AgentDuet → Nova Sonic 2 (Claudia voice)
                                 ↓
                       transcript → Nova text (Bedrock)
               ┌─────────────────┼─────────────────┐
@@ -16,7 +16,7 @@ Patient call → Telcoflow → Nova Sonic 2 (Claudia voice)
 
 | Layer | Tool |
 | --- | --- |
-| Telcoflow | Phone audio |
+| AgentDuet | Phone audio |
 | Nova Sonic 2 | Claudia live voice |
 | Nova Lite/Pro | Post-call JSON extraction |
 | **gog** | Google Calendar (OAuth) |
@@ -69,7 +69,7 @@ python booking_agent.py
 
 | Variable | Purpose |
 | --- | --- |
-| `WSS_API_KEY`, `WSS_CONNECTOR_UUID` | Telcoflow |
+| `WSS_API_KEY`, `WSS_CONNECTOR_UUID` | AgentDuet |
 | `NOVA_MODEL_ID`, `NOVA_VOICE_ID` | Nova Sonic 2 live voice |
 | `NOVA_TEXT_MODEL` | Nova text model for post-call extraction (default `amazon.nova-lite-v1:0`) |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Bedrock credentials |
@@ -88,7 +88,7 @@ python booking_agent.py internal whatsapp --target +919322958608 --text "Hello"
 
 ## AWS Lightsail
 
-Full step-by-step guide: **[DEPLOYMENT.md](./DEPLOYMENT.md)** (instance size, gog OAuth, WhatsApp QR, systemd, Telcoflow, troubleshooting).
+Full step-by-step guide: **[DEPLOYMENT.md](./DEPLOYMENT.md)** (instance size, gog OAuth, WhatsApp QR, systemd, AgentDuet, troubleshooting).
 
 Summary: run **`openclaw gateway`** and **`python booking_agent.py`** as two systemd services; complete `gog auth` and WhatsApp login before going live.
 
