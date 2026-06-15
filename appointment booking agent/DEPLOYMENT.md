@@ -3,9 +3,9 @@
 This guide runs **two long-lived processes** on one Lightsail instance:
 
 1. **OpenClaw gateway** — WhatsApp Web session
-2. **`booking_agent.py`** — Telcoflow inbound calls + Nova Sonic 2 (Claudia) + Nova text extraction + gog/WhatsApp
+2. **`booking_agent.py`** — AgentDuet inbound calls + Nova Sonic 2 (Claudia) + Nova text extraction + gog/WhatsApp
 
-Telcoflow connects **outbound** from your instance to Telcoflow’s servers (WebSocket). You do not need to open an inbound port for phone calls, but you need stable **outbound HTTPS (443)** and enough RAM for Node + Python + live audio.
+AgentDuet connects **outbound** from your instance to AgentDuet’s servers (WebSocket). You do not need to open an inbound port for phone calls, but you need stable **outbound HTTPS (443)** and enough RAM for Node + Python + live audio.
 
 ---
 
@@ -13,7 +13,7 @@ Telcoflow connects **outbound** from your instance to Telcoflow’s servers (Web
 
 | Item | Where to get it |
 | --- | --- |
-| Telcoflow `WSS_API_KEY` + `WSS_CONNECTOR_UUID` | [Telcoflow dashboard](https://www.telcoflow.com/) |
+| AgentDuet `WSS_API_KEY` + `WSS_CONNECTOR_UUID` |
 | AWS Bedrock creds | Nova Sonic 2 voice + Nova text post-call — **Python 3.12+** |
 | Google account for clinic calendar | For `gog auth` (OAuth) |
 | Dedicated WhatsApp number (recommended) | SIM or spare phone for OpenClaw |
@@ -36,7 +36,7 @@ Telcoflow connects **outbound** from your instance to Telcoflow’s servers (Web
 **Networking**
 
 - Default: outbound internet works.  
-- No inbound firewall rule required for Telcoflow.  
+- No inbound firewall rule required for AgentDuet.  
 - Optional: restrict SSH (port 22) to your IP in Lightsail **Networking → Firewall**.
 
 ---
@@ -330,7 +330,7 @@ sudo journalctl -u healthfirst-claudia -f
 
 ## Quick reference links
 
-- [Telcoflow docs](https://docs.telcoflow.com)
+- [AgentDuet docs](https://docs.AgentDuet.com)
 - [OpenClaw WhatsApp](https://docs.openclaw.ai/channels/whatsapp)
 - [openclaw message send](https://docs.openclaw.ai/cli/message)
 - [gog calendar](https://gogcli.sh/commands/gog-calendar.html)
