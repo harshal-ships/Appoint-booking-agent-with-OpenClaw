@@ -1,5 +1,0 @@
---extra-index-url https://test.pypi.org/simple/
-google-genai>=1.0.0
-telcoflow-sdk==0.27.1
-python-dotenv>=1.0.0
-aws-sdk-bedrock-runtime>=0.6.0
