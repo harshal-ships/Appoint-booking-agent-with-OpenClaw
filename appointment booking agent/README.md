@@ -83,7 +83,7 @@ python booking_agent.py
 
 ```bash
 python booking_agent.py internal create-booking --payload '{"patient_name":"Jane",...}' --call-id abc --fallback-phone +1...
-python booking_agent.py internal whatsapp --target +919322958608 --text "Hello"
+python booking_agent.py internal whatsapp --target +xxxxxxxxxx --text "Hello"
 ```
 
 ## AWS Lightsail
