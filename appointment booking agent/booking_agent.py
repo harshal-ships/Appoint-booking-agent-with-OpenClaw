@@ -716,7 +716,10 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not match:
         return None
-    parsed = json.loads(match.group(0))
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
     return parsed if isinstance(parsed, dict) else None
 
 
