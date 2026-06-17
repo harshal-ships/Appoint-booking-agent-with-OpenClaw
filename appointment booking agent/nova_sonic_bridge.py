@@ -1,14 +1,10 @@
 """Bridge one Telcoflow phone call to Amazon Nova 2 Sonic (Bedrock bidirectional stream).
 
 Nova Sonic expects 16 kHz LPCM input and returns 24 kHz LPCM output.
-Telcoflow uses 24 kHz PCM — we downsample caller audio and pass model audio through.
-
-Docs: https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-getting-started.html
 """
 from __future__ import annotations
 
 import asyncio
-import audioop
 import base64
 import json
 import logging
@@ -32,6 +28,7 @@ logger = logging.getLogger(__name__)
 TELECOFLOW_SAMPLE_RATE = 24000
 NOVA_INPUT_SAMPLE_RATE = 16000
 NOVA_OUTPUT_SAMPLE_RATE = 24000
+MAX_CALL_DURATION_SECONDS = 600
 
 ToolHandler = Callable[[str, dict[str, Any]], Awaitable[str]]
 
@@ -82,7 +79,7 @@ class NovaSonicBridge:
 
         self.transcript: list[TranscriptLine] = []
         self.tool_calls: list[dict[str, Any]] = []
-        self._resample_state: tuple[bytes, int] | None = None
+        self._resample_remainder = b""
 
         self._pending_tool_name: str | None = None
         self._pending_tool_use_id: str | None = None
@@ -117,15 +114,38 @@ class NovaSonicBridge:
         logger.info("Nova transcript [%s]: %s", role, clean)
 
     def _downsample_to_nova(self, chunk: bytes) -> bytes:
-        converted, self._resample_state = audioop.ratecv(
-            chunk,
-            2,
-            1,
-            TELECOFLOW_SAMPLE_RATE,
-            NOVA_INPUT_SAMPLE_RATE,
-            self._resample_state,
-        )
-        return converted
+        """Downsample 24 kHz → 16 kHz. Uses audioop on ≤3.12, pure-Python on 3.13+."""
+        try:
+            import audioop
+            converted, self._resample_remainder = audioop.ratecv(
+                chunk, 2, 1,
+                TELECOFLOW_SAMPLE_RATE, NOVA_INPUT_SAMPLE_RATE,
+                self._resample_remainder if self._resample_remainder else None,
+            )
+            return converted
+        except ImportError:
+            pass
+
+        import struct
+        data = self._resample_remainder + chunk
+        self._resample_remainder = b""
+        frame_size = 2
+        n_samples = len(data) // frame_size
+        if n_samples == 0:
+            return b""
+        samples = struct.unpack(f"<{n_samples}h", data[: n_samples * frame_size])
+        self._resample_remainder = data[n_samples * frame_size :]
+        ratio = TELECOFLOW_SAMPLE_RATE / NOVA_INPUT_SAMPLE_RATE
+        out_len = int(n_samples / ratio)
+        out = []
+        for i in range(out_len):
+            src = i * ratio
+            idx = int(src)
+            frac = src - idx
+            s0 = samples[idx]
+            s1 = samples[min(idx + 1, n_samples - 1)]
+            out.append(int(s0 + frac * (s1 - s0)))
+        return struct.pack(f"<{len(out)}h", *out)
 
     async def start_session(self) -> None:
         if not self._client:
@@ -400,6 +420,8 @@ class NovaSonicBridge:
             logger.exception("Nova Sonic response loop failed")
         finally:
             self._is_active = False
+            if hasattr(self, "_call_ended") and self._call_ended:
+                self._call_ended.set()
 
     async def end_session(self) -> None:
         if not self._is_active:
@@ -418,6 +440,7 @@ class NovaSonicBridge:
         """Bridge a single Telcoflow call through Nova Sonic until hangup."""
         self._call = call
         call_ended = asyncio.Event()
+        self._call_ended = call_ended
 
         @call.on(events.CALL_TERMINATED)
         def on_terminated() -> None:
@@ -440,13 +463,16 @@ class NovaSonicBridge:
 
         stream_task = asyncio.create_task(stream_caller_audio())
         try:
-            await call_ended.wait()
+            await asyncio.wait_for(call_ended.wait(), timeout=MAX_CALL_DURATION_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("Call %s exceeded max duration (%ds), ending", call.call_id, MAX_CALL_DURATION_SECONDS)
         finally:
             stream_task.cancel()
             await asyncio.gather(stream_task, return_exceptions=True)
             await self.end_audio_input()
             await self.end_session()
             self._call = None
+            self._call_ended = None
 
         return NovaCallResult(
             call_id=call.call_id,
