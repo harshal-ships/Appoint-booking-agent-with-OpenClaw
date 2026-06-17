@@ -526,7 +526,7 @@ def normalize_e164(phone: str, fallback: str = "") -> str:
     digits = re.sub(r"\D", "", raw)
     if digits.startswith("00"):
         digits = digits[2:]
-    # Already includes country code (e.g. 919322958608 for India)
+   
     if len(digits) >= 11:
         return f"+{digits}"
     return f"+{DEFAULT_PHONE_COUNTRY_CODE}{digits}"
@@ -1091,7 +1091,7 @@ def format_patient_receipt(
     if appointment_date and appointment_time:
         lines.append(f"Date: {appointment_date}")
         lines.append(f"Time: {appointment_time}")
-    lines.append("We look forward to seeing you. Reply if you need to change or cancel.")
+    lines.append("We look forward to seeing you.")
     return "\n".join(lines)
 
 
